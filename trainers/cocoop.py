@@ -1,6 +1,6 @@
 import os.path as osp
 from collections import OrderedDict
-import math
+from . import mask_net
 
 import torch
 import torch.nn as nn
@@ -71,7 +71,7 @@ class PromptLearner(nn.Module):
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = cfg.INPUT.SIZE[0]
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
-
+        
         if ctx_init:
             # use given words to initialize context vectors
             ctx_init = ctx_init.replace("_", " ")
@@ -82,7 +82,7 @@ class PromptLearner(nn.Module):
             ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
             prompt_prefix = ctx_init
         else:
-            # random initialization
+        # random initialization
             ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
             nn.init.normal_(ctx_vectors, std=0.02)
             prompt_prefix = " ".join(["X"] * n_ctx)
@@ -91,16 +91,18 @@ class PromptLearner(nn.Module):
         print(f"Number of context words (tokens): {n_ctx}")
 
         self.ctx = nn.Parameter(ctx_vectors)
-
+        '''
         self.meta_net = nn.Sequential(OrderedDict([
             ("linear1", nn.Linear(vis_dim, vis_dim // 16)),
             ("relu", nn.ReLU(inplace=True)),
             ("linear2", nn.Linear(vis_dim // 16, ctx_dim))
         ]))
-        
+        '''
+        self.meta_net = mask_net.MaskNet(in_features=n_ctx*ctx_dim, mask_dim=vis_dim, output_size=ctx_dim*n_ctx)
+
         if cfg.TRAINER.COCOOP.PREC == "fp16":
             self.meta_net.half()
-
+        
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
         prompts = [prompt_prefix + " " + name + "." for name in classnames]
@@ -117,6 +119,7 @@ class PromptLearner(nn.Module):
 
         self.n_cls = n_cls
         self.n_ctx = n_ctx
+        self.ctx_dim = ctx_dim
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
         self.name_lens = name_lens
     
@@ -144,11 +147,13 @@ class PromptLearner(nn.Module):
     def forward(self, im_features):
         prefix = self.token_prefix
         suffix = self.token_suffix
-        ctx = self.ctx                     # (n_ctx, ctx_dim)
-        bias = self.meta_net(im_features)  # (batch, ctx_dim)
-        bias = bias.unsqueeze(1)           # (batch, 1, ctx_dim)
-        ctx = ctx.unsqueeze(0)             # (1, n_ctx, ctx_dim)
-        ctx_shifted = ctx + bias           # (batch, n_ctx, ctx_dim)
+        #ctx = self.ctx                     # (n_ctx, ctx_dim)
+        #bias = self.meta_net(im_features)  # (batch, ctx_dim)
+        #bias = bias.unsqueeze(1)           # (batch, 1, ctx_dim)
+        #ctx = ctx.unsqueeze(0)             # (1, n_ctx, ctx_dim)
+        #ctx_shifted = ctx + bias           # (batch, n_ctx, ctx_dim)
+        output = self.meta_net(input=self.ctx.view(-1), mask_input=im_features)
+        ctx_shifted = output.reshape(im_features.shape[0],self.n_ctx, self.ctx_dim)
         
         # Use instance-conditioned context tokens for all classes
         prompts = []

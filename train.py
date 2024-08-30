@@ -1,4 +1,8 @@
 import argparse
+
+import os
+os.environ["CUDA_VISIBLE_DEVICES"]= "1,0"
+
 import torch
 
 from dassl.utils import setup_logger, set_random_seed, collect_env_info
@@ -22,10 +26,33 @@ import datasets.imagenet_sketch
 import datasets.imagenetv2
 import datasets.imagenet_a
 import datasets.imagenet_r
+from datasets.domainbed.datasets import *
 
-import trainers.coop
+import trainers.coop as coop
+import trainers.gradcam as gradcam
 import trainers.cocoop
 import trainers.zsclip
+
+#import cv2
+
+
+import urllib.request
+import numpy as np
+import torch 
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import clip
+from PIL import Image
+from scipy.ndimage import filters
+from torch import nn
+
+from tqdm import tqdm
+#from datasets import load_dataset
+import torchvision.datasets as dset
+from torchvision import transforms
+from datasets import converter_domainbed
+import torchvision
+#import torchvision.transforms as T
 
 
 def print_args(args, cfg):
@@ -88,14 +115,14 @@ def extend_cfg(cfg):
     from yacs.config import CfgNode as CN
 
     cfg.TRAINER.COOP = CN()
-    cfg.TRAINER.COOP.N_CTX = 16  # number of context vectors
+    cfg.TRAINER.COOP.N_CTX = 4  # number of context vectors
     cfg.TRAINER.COOP.CSC = False  # class-specific context
     cfg.TRAINER.COOP.CTX_INIT = ""  # initialization words
-    cfg.TRAINER.COOP.PREC = "fp16"  # fp16, fp32, amp
+    cfg.TRAINER.COOP.PREC = "fp32"  # fp16, fp32, amp
     cfg.TRAINER.COOP.CLASS_TOKEN_POSITION = "end"  # 'middle' or 'end' or 'front'
 
     cfg.TRAINER.COCOOP = CN()
-    cfg.TRAINER.COCOOP.N_CTX = 16  # number of context vectors
+    cfg.TRAINER.COCOOP.N_CTX = 4  # number of context vectors
     cfg.TRAINER.COCOOP.CTX_INIT = ""  # initialization words
     cfg.TRAINER.COCOOP.PREC = "fp16"  # fp16, fp32, amp
 
@@ -120,13 +147,22 @@ def setup_cfg(args):
     # 4. From optional input arguments
     cfg.merge_from_list(args.opts)
 
-    cfg.freeze()
+    #config_file = "configs." + args.config.replace("/", ".")
+    #print(f"\nLoading experiment {args.config}\n")
+    config = __import__("ResNet50", fromlist=[""]).config
+    #configs/trainers/CoOp/CIRL/ResNet50.py
 
-    return cfg
+    #cfg.freeze()
+
+    return cfg, config
+
 
 
 def main(args):
-    cfg = setup_cfg(args)
+
+    print(torch.cuda.is_available())
+    print(torch.cuda.device_count())
+    cfg, config = setup_cfg(args)
     if cfg.SEED >= 0:
         print("Setting fixed seed: {}".format(cfg.SEED))
         set_random_seed(cfg.SEED)
@@ -135,11 +171,14 @@ def main(args):
     if torch.cuda.is_available() and cfg.USE_CUDA:
         torch.backends.cudnn.benchmark = True
 
-    print_args(args, cfg)
+    #print_args(args, cfg)
     print("Collecting env info ...")
     print("** System info **\n{}\n".format(collect_env_info()))
 
+
     trainer = build_trainer(cfg)
+    trainer.preload(args, config)
+    #trainer.pretrain(cfg)
 
     if args.eval_only:
         trainer.load_model(args.model_dir, epoch=args.load_epoch)
@@ -152,8 +191,22 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", type=str, default="", help="path to dataset")
-    parser.add_argument("--output-dir", type=str, default="", help="output directory")
+    parser.add_argument("--source", type=str, default=["photo", "cartoon", "art_painting"], help="Source", nargs='+')
+    parser.add_argument("--target", type=str, default="sketch", help="Target")
+    parser.add_argument("--input_dir", default='datasets/domainbed/data/PACS/images', help="The directory of dataset lists")
+    parser.add_argument("--output_dir", default='./output', help="The directory to save logs and models")
+    parser.add_argument("--config", default="RetNet50", help="Experiment configs")
+    parser.add_argument("--tf_logger", default=True, help="If true will save tensorboard compatible logs")
+
+    parser.add_argument("--domain", "-d", default="sketch", help="Target")
+    parser.add_argument("--gpu", "-g", default=0, type=int, help="Gpu ID")
+    parser.add_argument("--times", "-t", default=1, type=int, help="Repeat times")
+
+
+
+
+    parser.add_argument("--root", type=str, default="datasets/domainbed/data", help="path to dataset")
+    parser.add_argument("--output-dir", type=str, default=".", help="output directory")
     parser.add_argument(
         "--resume",
         type=str,
@@ -164,24 +217,24 @@ if __name__ == "__main__":
         "--seed", type=int, default=-1, help="only positive value enables a fixed seed"
     )
     parser.add_argument(
-        "--source-domains", type=str, nargs="+", help="source domains for DA/DG"
+        "--source-domains", type=str, default=["photo","art_painting","cartoon"], nargs="+", help="source domains for DA/DG"
     )
     parser.add_argument(
-        "--target-domains", type=str, nargs="+", help="target domains for DA/DG"
+        "--target-domains", type=str, default=["sketch"], nargs="+", help="target domains for DA/DG"
     )
     parser.add_argument(
         "--transforms", type=str, nargs="+", help="data augmentation methods"
     )
     parser.add_argument(
-        "--config-file", type=str, default="", help="path to config file"
+        "--config-file", type=str, default="./configs/trainers/CoOp/vit_b16_ep50.yaml", help="path to config file"
     )
     parser.add_argument(
         "--dataset-config-file",
         type=str,
-        default="",
+        default="configs/datasets/PACS.yaml",
         help="path to config file for dataset setup",
     )
-    parser.add_argument("--trainer", type=str, default="", help="name of trainer")
+    parser.add_argument("--trainer", type=str, default="CoOp", help="name of trainer")
     parser.add_argument("--backbone", type=str, default="", help="name of CNN backbone")
     parser.add_argument("--head", type=str, default="", help="name of head")
     parser.add_argument("--eval-only", action="store_true", help="evaluation only")
